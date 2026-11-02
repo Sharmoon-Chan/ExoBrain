@@ -616,3 +616,62 @@ another user's chats, documents or SSE. Confirm that shared resources are
 read-only, account disable/password reset revokes active sessions, administrator
 model changes affect actual requests and existing knowledge-base bindings remain
 unchanged when a new default Embedding model is selected.
+
+## Outbound tunnel connectivity
+
+The public hostname is served through a Cloudflare Tunnel connector
+(`cloudflared`, systemd unit, token file `/etc/cloudflared/token`). Its only job
+is outbound reachability to the Cloudflare edge (TCP/UDP 7844); the application
+itself is reachable at `127.0.0.1:18082` and does not depend on the tunnel.
+
+On 2026-11-02 the site returned Cloudflare `Error 1033` for about eight hours:
+`cloudflared` was running but every connector failed with
+`TLS handshake with edge error: EOF`. The unit had been routing its edge traffic
+through a local proxy (`iptables -t nat OUTPUT ... --dport 7844 -j REDIRECT
+--to-ports 7892`, applied by `cloudflared-proxy-route`), and that proxy had no
+nodes left (`proxy-providers` subscription never fetched), so the handshake
+could not complete.
+
+Current configuration: the connector talks to the edge **directly** over
+HTTP/2, and the redirect/proxy hop is gone.
+
+```bash
+cat /etc/systemd/system/cloudflared.service.d/override.conf   # --protocol http2
+ls /etc/systemd/system/cloudflared.service.d/                 # proxy-route.conf moved to backup
+iptables -t nat -S OUTPUT | grep 7844                         # no redirect rule
+tail -20 /var/log/cloudflared.log                             # want "Registered tunnel connection ... protocol=http2"
+```
+
+Diagnose in this order: `systemctl is-active cloudflared`; grep the log for
+`Registered tunnel connection` (4 connectors expected) versus
+`TLS handshake with edge error`; test direct TCP `7844` to an edge IP (for
+example `198.41.192.167`) with the redirect rules removed; check
+`cloudflared --version` preflight output, which reports DNS, UDP, TCP and API
+reachability. `Error 1033` means no healthy connector; a reachable connector with
+a broken origin shows `502` instead.
+
+Two checks separate a gateway fault from an origin or provider fault, and both
+must pass before calling the deployment healthy:
+
+- `curl -sS -o /dev/null -w '%{http_code}' https://<host>/` and `/health` return
+  `200` (through the tunnel), and `curl http://127.0.0.1:18082/health` returns
+  `200` (bypassing the tunnel).
+- A real guest question completes. A reachable site with a dead model provider
+  still shows a page, but every run ends `FAILED / EXECUTION_FAILED` in about
+  ten seconds, which is the model client's connect timeout. Compare
+  `exobrain_run_event` (`MODEL_CALL`, `FAILED`) with the resolver answer for the
+  configured model base URL: on 2026-11-02 the LLM relay domain had been
+  released and resolved to a domain-parking address, so every model call timed
+  out while retrieval and the UI stayed healthy.
+
+When the provider endpoint has to change, edit the private
+`secrets/application-prod.yaml` (model base URL and key), back it up first, then
+restart only the application container. The model catalog in the database and
+that YAML must agree on endpoint and key; a key valid for one provider returns
+`401 Invalid token` at another.
+
+Rollback to the proxy path (only useful when that proxy has working nodes):
+restore `/root/backups/cloudflared-*/systemd-dropin/proxy-route.conf.disabled`
+as `proxy-route.conf`, revert `override.conf` from the same backup directory,
+`systemctl daemon-reload`, `systemctl restart cloudflared`. Never regenerate the
+tunnel token; it is not part of this repository.
