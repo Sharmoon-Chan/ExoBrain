@@ -90,7 +90,8 @@ const RUN_STATUS_LABELS: Record<RunStatus, string> = {
   QUEUED: "排队中",
   RUNNING: "执行中",
   SUCCEEDED: "已完成",
-  FAILED: "失败",
+  // 面向访客用「未完成」：失败已经由下面的说明与重试按钮承接，不再用刺眼的「失败」当标题。
+  FAILED: "未完成",
   CANCELLED: "已取消",
   INTERRUPTED: "已中断",
 };
@@ -99,7 +100,7 @@ const RUN_STATUS_CLASSES: Record<RunStatus, string> = {
   QUEUED: "text-slate-500",
   RUNNING: "text-sky-700",
   SUCCEEDED: "text-teal-700",
-  FAILED: "text-rose-700",
+  FAILED: "text-amber-700",
   CANCELLED: "text-amber-700",
   INTERRUPTED: "text-amber-700",
 };
@@ -114,20 +115,93 @@ const RUN_EVENT_LABELS: Record<RunEventType, string> = {
   ERROR: "执行错误",
 };
 
-/** 安全错误码的中文说明；未知码原样显示固定分类，不推测原因。 */
+/**
+ * 错误码只在「查看过程」里作为技术细节出现，正文里不出现英文枚举。
+ * 每个失败场景给一句人话说明 + 一句下一步建议，避免看起来像系统崩了。
+ */
 const RUN_ERROR_LABELS: Record<string, string> = {
-  AUTHORIZATION_REVOKED: "权限已撤销",
-  MODEL_UNAVAILABLE: "模型服务不可用（已重试）",
-  MODEL_CALL_FAILED: "模型调用失败",
+  AUTHORIZATION_REVOKED: "登录状态失效",
+  MODEL_UNAVAILABLE: "模型服务未响应（已自动重试）",
+  MODEL_CALL_FAILED: "模型服务连接失败",
   UPSTREAM_BUSY: "模型服务繁忙",
   TOOL_FAILED: "工具执行失败",
   RETRIEVAL_UNAVAILABLE: "知识库检索不可用",
   RETRIEVAL_DENIED: "知识库检索被拒绝",
-  MESSAGE_PERSISTENCE_FAILED: "消息保存失败",
-  NO_ANSWER_PRODUCED: "本次执行没有产出面向用户的答复",
-  INVALID_ANSWER_FORMAT: "模型答复格式异常，请重新提问",
-  EXECUTION_FAILED: "执行失败",
+  MESSAGE_PERSISTENCE_FAILED: "答复保存失败",
+  NO_ANSWER_PRODUCED: "未产出答复",
+  INVALID_ANSWER_FORMAT: "答复未通过内容核对",
+  EXECUTION_FAILED: "执行中断",
 };
+
+interface FailureText {
+  /** 一句话说明发生了什么，不暴露内部枚举。 */
+  title: string;
+  /** 下一步该怎么做。 */
+  hint: string;
+  /** 是否值得让访客直接重试同一问题。 */
+  retryable: boolean;
+}
+
+/** 按错误分类给出面向访客的说明；未知分类只描述现象，不猜测原因。 */
+function failureText(errorCode: string | null | undefined, status: RunStatus): FailureText {
+  switch (errorCode) {
+    case "INVALID_ANSWER_FORMAT":
+      return {
+        title: "这次的回答没能通过自动核对，所以没有展示",
+        hint: "回答里的引用编号和检索到的来源对不上时，系统会拦下整轮内容，避免给你看未经核实的出处。重新提问一次通常就正常。",
+        retryable: true,
+      };
+    case "MODEL_UNAVAILABLE":
+    case "MODEL_CALL_FAILED":
+    case "UPSTREAM_BUSY":
+      return {
+        title: "模型服务这次没有返回结果",
+        hint: "通常是服务商临时繁忙；系统已自动重试仍未成功。稍等几秒再问一次即可。",
+        retryable: true,
+      };
+    case "RETRIEVAL_UNAVAILABLE":
+    case "RETRIEVAL_DENIED":
+      return {
+        title: "这次没能检索到知识库内容",
+        hint: "可以换个说法再问，或稍后再试一次。",
+        retryable: true,
+      };
+    case "AUTHORIZATION_REVOKED":
+      return {
+        title: "登录状态已失效，这次没有继续执行",
+        hint: "重新登录后再提问即可；知识库与历史记录都不受影响。",
+        retryable: false,
+      };
+    case "MESSAGE_PERSISTENCE_FAILED":
+      return {
+        title: "回答已经生成，但没能保存下来",
+        hint: "重新提问即可；如果反复出现，可以在「查看过程」里展开错误详情反馈。",
+        retryable: true,
+      };
+    case "NO_ANSWER_PRODUCED":
+      return {
+        title: "这次没有产出可展示的回答",
+        hint: "重新提问一次即可。",
+        retryable: true,
+      };
+    default:
+      if (status === "CANCELLED") {
+        return { title: "这次运行在给出回答前被取消了", hint: "需要的话点下面的按钮重新提问。", retryable: true };
+      }
+      if (status === "INTERRUPTED") {
+        return {
+          title: "服务重启打断了这次运行，所以没有回答",
+          hint: "系统不会自动重放已中断的请求，重新提问即可。",
+          retryable: true,
+        };
+      }
+      return {
+        title: "这次没能在限定时间内给出回答",
+        hint: "可能是网络或服务临时波动。重新提问即可；连续出现可在「查看过程」里展开错误详情反馈。",
+        retryable: true,
+      };
+  }
+}
 
 /** 只格式化服务端记录的耗时；未知就是「未记录」，不用浏览器计时补齐。 */
 function formatDuration(ms: number | null | undefined): string {
@@ -164,24 +238,15 @@ function runEventDetail(event: RunEventView): string {
   return RUN_EVENT_LABELS[event.type];
 }
 
-function runFailureDetail(run: RunSummaryView): string {
+/**
+ * 仍在进行中的状态说明。终态说明统一由 {@link failureText} 给出，
+ * 这里不再重复一遍，避免「标题」与「正文」说同一句话。
+ */
+function runInProgressDetail(run: RunSummaryView): string | null {
   const status: RunStatus = run.interrupted ? "INTERRUPTED" : run.status;
-  switch (status) {
-    case "QUEUED":
-      return "任务已受理，正在等待执行。";
-    case "RUNNING":
-      return "正在执行；刷新页面不会中断它。";
-    case "CANCELLED":
-      return "本次运行在产出答复前被取消。";
-    case "INTERRUPTED":
-      return "本次运行在产出答复前中断（进程重启或崩溃），系统不会自动重放；可以重新提问。";
-    case "FAILED":
-      return run.errorCode
-        ? `本次运行失败（${RUN_ERROR_LABELS[run.errorCode] ?? run.errorCode}），没有产出答复。`
-        : "本次运行失败，没有产出答复；可以重新提问。";
-    default:
-      return "本次运行没有产出答复。";
-  }
+  if (status === "QUEUED") return "任务已受理，正在等待执行。";
+  if (status === "RUNNING") return "正在执行；刷新页面不会中断它。";
+  return null;
 }
 
 interface CitationGroup {
@@ -421,6 +486,12 @@ const ProcessDisclosure: React.FC<{
         {opened && run && canLoadTimeline && <RunTimeline runId={run.runId} />}
         {opened && run && !canLoadTimeline && <p className="text-slate-400">当前页面没有读取执行过程所需的信息。</p>}
         {opened && run && formatUsage(run) && <p className="text-slate-400">{formatUsage(run)}</p>}
+        {/* 错误分类是给排查用的技术细节：只在展开后出现，正文里不展示英文枚举。 */}
+        {opened && run?.errorCode && (
+          <p className="break-all font-mono text-[11px] text-slate-400">
+            错误分类 {run.errorCode} · {RUN_ERROR_LABELS[run.errorCode] ?? "未分类"}
+          </p>
+        )}
         {toolCalls.length > 0 && (
           <div className="flex flex-col gap-1.5">
             <p className="font-medium text-slate-600">工具调用</p>
@@ -463,20 +534,33 @@ const ProcessDisclosure: React.FC<{
 /**
  * 没有 assistant 消息的终态运行也必须可见。提交前取消、首次模型调用失败、运行中进程崩溃
  * 都可能不产生 assistant 消息，状态只能来自持久化的运行记录。
+ *
+ * 访客看到的是「发生了什么 + 该怎么办 + 一个重试按钮」；英文错误码只留在展开后的过程详情里。
  */
-const RunOutcomeNotice: React.FC<{ run: RunSummaryView }> = ({ run }) => {
+const RunOutcomeNotice: React.FC<{ run: RunSummaryView; onRetry?: () => void }> = ({ run, onRetry }) => {
   const status: RunStatus = run.interrupted ? "INTERRUPTED" : run.status;
+  const busy = status === "QUEUED" || status === "RUNNING";
+  const failure = failureText(run.errorCode, status);
   return (
-    <div className="mt-1 min-w-0 rounded-xl border border-dashed border-amber-200 bg-amber-50/70 px-3 py-2 text-xs">
+    <div
+      role={busy ? "status" : "note"}
+      className="mt-1 min-w-0 rounded-xl border border-dashed border-amber-200 bg-amber-50/70 px-3 py-2 text-xs"
+    >
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-slate-700">本次回答</span>
+        <span className="font-medium text-slate-700">{busy ? "本次回答" : "这次没有拿到回答"}</span>
         <span className={RUN_STATUS_CLASSES[status] ?? "text-slate-600"}>{RUN_STATUS_LABELS[status] ?? status}</span>
-        {run.errorCode && <span className="font-mono text-slate-400">{run.errorCode}</span>}
         {typeof run.durationMs === "number" && run.durationMs > 0 && (
           <span className="text-slate-400">耗时 {(run.durationMs / 1000).toFixed(1)} s</span>
         )}
       </div>
-      <p className="mt-1 leading-5 text-slate-600">{runFailureDetail(run)}</p>
+      <p className={(busy ? "mt-1" : "mt-1.5") + " leading-5 text-slate-600"}>
+        {busy ? runInProgressDetail(run) : failure.hint}
+      </p>
+      {!busy && failure.retryable && onRetry && (
+        <Button size="small" className="mt-2" icon={<ReloadOutlined />} onClick={onRetry}>
+          重新提问
+        </Button>
+      )}
     </div>
   );
 };
@@ -797,7 +881,14 @@ const AgentChatHistory: React.FC<AgentChatHistoryProps> = ({
               {turn.question && (
                 <div className="flex flex-col items-end gap-1">
                   <Bubble content={<span className="block min-w-0 break-words">{turn.question.content}</span>} placement="end" />
-                  {answerlessRun && <div className="w-full max-w-3xl"><RunOutcomeNotice run={answerlessRun} /></div>}
+                  {answerlessRun && (
+                    <div className="w-full max-w-3xl">
+                      <RunOutcomeNotice
+                        run={answerlessRun}
+                        onRetry={onAskFollowUp && turn.question ? () => void onAskFollowUp(turn.question!.content) : undefined}
+                      />
+                    </div>
+                  )}
                   {missingAssociatedRun && (
                     <p className="text-xs text-amber-700">未能读取这条问题对应的执行记录。</p>
                   )}
@@ -817,12 +908,26 @@ const AgentChatHistory: React.FC<AgentChatHistoryProps> = ({
                         <div className="w-full min-w-0 break-words [&_a]:break-all">
                           {answer.content && <AnswerBody messageId={answer.id} content={answer.content} />}
                           {citations.length > 0 && <CitationEntry citations={citations} onOpen={openCitation} />}
-                          {failedRun && (
-                            <p className="mt-1 text-xs text-rose-700">
-                              {RUN_STATUS_LABELS[failedRun.interrupted ? "INTERRUPTED" : failedRun.status]}：
-                              {runFailureDetail(failedRun)}
-                            </p>
-                          )}
+                          {failedRun && (() => {
+                            const status = failedRun.interrupted ? "INTERRUPTED" : failedRun.status;
+                            const failure = failureText(failedRun.errorCode, status);
+                            return (
+                              <div className="mt-2 rounded-lg border border-dashed border-amber-200 bg-amber-50/70 px-2.5 py-2 text-xs">
+                                <p className="font-medium leading-5 text-slate-700">{failure.title}</p>
+                                <p className="mt-0.5 leading-5 text-slate-600">{failure.hint}</p>
+                                {failure.retryable && onAskFollowUp && turn.question && (
+                                  <Button
+                                    size="small"
+                                    className="mt-1.5"
+                                    icon={<ReloadOutlined />}
+                                    onClick={() => void onAskFollowUp(turn.question!.content)}
+                                  >
+                                    重新提问
+                                  </Button>
+                                )}
+                              </div>
+                            );
+                          })()}
                           {runConfirmedMissing && !showProcess && (
                             <p className="mt-2 text-xs text-slate-400">这条历史消息没有执行记录</p>
                           )}

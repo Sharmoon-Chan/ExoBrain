@@ -18,10 +18,47 @@ export interface RequestOptions extends RequestInit {
 class ReportedApiError extends Error {}
 export class AuthenticationError extends Error {}
 
+/**
+ * 浏览器与底层库抛出的英文原文不适合直接给访客看（「Failed to fetch」看起来像页面坏了）。
+ * 这里统一换成「发生了什么 + 可以怎么办」；服务端返回的中文说明原样保留。
+ */
+const TRANSIENT_NETWORK =
+  /failed to fetch|networkerror|network error|load failed|fetch failed|err_network|err_internet_disconnected|net::/i;
+
+const STATUS_TEXT: Record<number, string> = {
+  400: "这个请求的内容不完整，请检查后重试",
+  403: "当前账号没有执行这个操作的权限",
+  404: "要访问的内容不在了，可能已被删除",
+  409: "数据刚被改过，请刷新后重试",
+  413: "文件太大，超出了这次上传的上限",
+  429: "操作太频繁，请等几秒再试",
+  500: "服务这边临时出错，请稍后重试",
+  502: "服务正在重启或连接中断，请稍后重试",
+  503: "服务正在维护，请稍后重试",
+  504: "服务响应超时，请稍后重试",
+};
+
+function statusMessage(status: number): string {
+  return STATUS_TEXT[status] ?? `服务返回了异常状态（HTTP ${status}），请稍后重试`;
+}
+
+/** 把任意异常翻译成一句访客能看懂的话；拿不到可读信息时用调用方给的兜底文案。 */
+export function humanizeError(error: unknown, fallback: string): string {
+  if (!(error instanceof Error)) return fallback;
+  const raw = error.message.trim();
+  if (!raw) return fallback;
+  if (TRANSIENT_NETWORK.test(raw)) return "网络连接不稳定，这次的请求没有送达服务器，请重试";
+  const http = /HTTP (\d{3})/.exec(raw);
+  if (http) return statusMessage(Number(http[1]));
+  // 没有中文字符说明是浏览器或底层库的英文原文，不适合直接展示。
+  if (!/[\u4e00-\u9fff]/.test(raw)) return fallback;
+  return raw;
+}
+
 export function showRequestError(error: unknown, fallback: string): void {
   if (!(error instanceof ReportedApiError) && !(error instanceof AuthenticationError)
     && !(error instanceof DOMException && error.name === "AbortError")) {
-    notify.error(error instanceof Error ? error.message : fallback);
+    notify.error(humanizeError(error, fallback));
   }
 }
 
@@ -67,7 +104,7 @@ async function handleResponse<T>(response: Response, silent: boolean, requestRev
     throw new AuthenticationError(data?.message || "请登录后继续");
   }
   if (!response.ok) {
-    const errorMessage = data?.message || `请求失败（HTTP ${response.status}）`;
+    const errorMessage = data?.message || statusMessage(response.status);
     if (!silent) notify.error(errorMessage);
     throw silent ? new Error(errorMessage) : new ReportedApiError(errorMessage);
   }
@@ -78,7 +115,7 @@ async function handleResponse<T>(response: Response, silent: boolean, requestRev
 
   // 检查业务状态码
   if (data.code !== 200) {
-    if (!silent) notify.error(data.message || "请求失败");
+    if (!silent) notify.error(data.message || "请求失败，请稍后重试");
     throw silent ? new Error(data.message || "请求失败") : new ReportedApiError(data.message || "请求失败");
   }
 

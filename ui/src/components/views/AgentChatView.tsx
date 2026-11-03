@@ -153,8 +153,9 @@ function SessionChatView({ sessionId, agentCatalog }: { sessionId: string; agent
     setWaitStartedAt(null);
     setStatus(null);
     setRunRevision((value) => value + 1);
-    setCompletionNotice(notice ?? (runStatus === "CANCELLED" ? "本次运行已取消。"
-      : runStatus === "SUCCEEDED" ? "" : "本次运行已结束，可在问题下查看状态。"));
+    // 终态提示不重复问题卡片里的说明：这里只说「这次有没有回答」，具体下一步交给卡片上的按钮。
+    setCompletionNotice(notice ?? (runStatus === "CANCELLED" ? "本次已取消。"
+      : runStatus === "SUCCEEDED" ? "" : "这次没有拿到回答，可以按提示重新提问。"));
     void refreshMessages().catch((error) => showRequestError(error, "聊天记录刷新失败"));
   }, [refreshMessages, setActiveRunId, setWaiting]);
 
