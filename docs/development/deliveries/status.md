@@ -210,3 +210,41 @@ SiliconFlow 的 `BAAI/bge-m3`。新条目当时是**按语言模型（LLM）登�
 
 - 仍未完成：验收方 R4 的 HTTP 故障注入脚本重跑、真实付费模型效果对比、GitHub Actions 远端执行。
 - 前端 20 个文件仍未提交，按用户要求先不提交。
+
+## 11. 生产发布（2026-11-03，提交 `6b04814`）
+
+**为什么发**：游客反馈「你是谁」返回 `INVALID_ANSWER_FORMAT`。定位为线上镜像
+`exobrain:20261020-ux-6774aee` 仍用旧协议与旧提示词，模型在正文里写了超出自己
+`citationIds` 列表的编号，服务端按设计拒绝整轮（`AnswerCitationFormatter.relabel`：
+`Model answer references a source that could not be verified`）。
+
+**发布内容**：
+
+| 项 | 值 |
+| --- | --- |
+| 代码 | `6b04814`（含 10-28 起的编号契约统一、输入投影修复、grounded-v1、429 诊断、可取消的节流等待） |
+| 后端镜像 | `exobrain:20261103-6b04814`（`FROM exobrain:20261020-ux-6774aee` + 覆盖 app.jar，JAR 62,984,060 字节） |
+| 前端 | **未重建**：`6774aee..6b04814` 之间没有 controller 与迁移改动，现有 `releases/20261020-ux-6774aee`（`ui/` + `admin/`）继续匹配，`current` 未切换 |
+| 数据库 | 无 schema 迁移 |
+| 助手提示词 | 换成统一编号契约版本（`[n]` = `citationIds` 第 n 项），语料日期按线上 10-19 版；写入前后 md5 校验一致 |
+| compose | `image` 指向新镜像；新增 `extra_hosts: happycoding.xyz:163.181.78.207`（该中转域名 8 个 IP 中 2 个从本机不可达，Java 客户端不换 IP 重试，会卡满 10 s 连接超时） |
+
+**验证（发布后，游客会话真实请求）**：
+
+| 问题 | 结果 |
+| --- | --- |
+| 你是谁 | SUCCEEDED 6123 ms，552 字，3 条引用（01 L9-15 / L19-23 / L33-36） |
+| 这个项目能做什么？ | SUCCEEDED 12188 ms，640 字，3 条引用（01 L3-5、03 L3-5、03 L22-31） |
+| 网络慢时重复点击发送会怎么样？ | SUCCEEDED 7253 ms，747 字，2 条引用（02 L8-22、03 L44-48） |
+| 引用里的编号怎么对应来源？ | SUCCEEDED 7669 ms，529 字，3 条引用（03 L22-31、01 L27-29、01 L9-15） |
+
+入口 `/`、`/admin/`、`/health` 均 200；发布后 12 次运行全部 `SUCCEEDED`，应用日志 0 条新增
+ERROR，无守卫拒绝、无模型 HTTP 失败；新代码的 `model input projection` 行已出现在日志中。
+
+**回滚**：`/root/backups/exobrain-20261103-155404/`（compose、密钥配置、nginx 全量 dump、
+`current` 指向、容器旧镜像 id、`pg_dump` 全库）。步骤：把 `compose.yaml` 的 `image` 改回
+`exobrain:20261020-ux-6774aee` 并去掉 `extra_hosts`，`docker compose up -d app`；
+提示词从备份恢复后再 `update agent set system_prompt = …`。
+
+**仍未做**：前端重建（UX-03/04/07 的界面改版仍在仓库里，未上生产）；默认消息窗口仍为 16；
+管理端登录未验证（`bootstrap-admin-password` 与实际口令可能已不一致）。
